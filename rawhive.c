@@ -13,9 +13,9 @@ DECLSPEC_IMPORT BOOL   WINAPI KERNEL32$WriteFile(HANDLE,LPCVOID,DWORD,LPDWORD,LP
 DECLSPEC_IMPORT BOOL   WINAPI KERNEL32$GetComputerNameA(LPSTR,LPDWORD);
 DECLSPEC_IMPORT VOID   WINAPI KERNEL32$GetSystemTimeAsFileTime(LPFILETIME);
 DECLSPEC_IMPORT DWORD  WINAPI KERNEL32$GetFileAttributesA(LPCSTR);
+DECLSPEC_IMPORT void   WINAPI MSVCRT$memset(void* dest, int c, size_t count);
 
-#define rh_zero(p,n)   __builtin_memset((p), 0, (n))
-#define rh_copy(d,s,n) __builtin_memcpy((d), (s), (n))
+#define rh_zero(p,n)   MSVCRT$memset((p), 0, (n))
 
 static BOOL rh_range_ok(UINT32 off, UINT32 len, UINT32 size) {
     return off <= size && len <= size - off;
